@@ -59,6 +59,9 @@ class MakeCards extends BaseComponent {
 						this._state[kColor] = typeMeta.colorDefault;
 						this._state[kIcon] = typeMeta.iconDefault;
 					});
+
+				Object.entries(MakeCards._DEFAULT_STATE)
+					.forEach(([k, v]) => this._state[k] = v);
 			});
 
 		ee(wrpConfig)`<h5 class="ve-split-v-center"><div>New Card Defaults</div>${btnResetDefaults}</h5>
@@ -92,6 +95,26 @@ class MakeCards extends BaseComponent {
 		};
 
 		Object.keys(MakeCards._AVAILABLE_TYPES).forEach(it => getColorIconConfigRow(it).appendTo(wrpConfig));
+
+		const cbImageFront = ComponentUiUtil.getCbBool(this, "isImageFront");
+		const iptImageFrontHeight = ComponentUiUtil.getIptInt(this, "imageFrontHeight", 100, {min: 20, max: 500, fallbackOnNaN: 100})
+			.addClass("ve-input-xs")
+			.addClass("ve-text-center");
+		const cbImageBack = ComponentUiUtil.getCbBool(this, "isImageBack");
+
+		ee(wrpConfig)`<h5>Images</h5>
+		<label class="ve-flex-v-center stripe-even ve-m-1">
+			<div class="ve-col-8 ve-pr-2">Include image on card front</div>
+			<div class="ve-col-4 ve-flex-vh-center">${cbImageFront}</div>
+		</label>
+		<div class="ve-flex-v-center stripe-even ve-m-1">
+			<div class="ve-col-8 ve-pr-2">Front image height (px)</div>
+			<div class="ve-col-4 ve-flex-vh-center">${iptImageFrontHeight}</div>
+		</div>
+		<label class="ve-flex-v-center stripe-even ve-m-1">
+			<div class="ve-col-8 ve-pr-2">Use image as card back</div>
+			<div class="ve-col-4 ve-flex-vh-center">${cbImageBack}</div>
+		</label>`;
 	}
 
 	_render_cardList () {
@@ -112,18 +135,7 @@ class MakeCards extends BaseComponent {
 			});
 		const btnExport = ee`<button class="ve-btn ve-btn-default"><span class="glyphicon glyphicon-download"></span> Export JSON</button>`
 			.onn("click", () => {
-				const toDownload = this._list.items.map(it => {
-					const entityMeta = MakeCards._AVAILABLE_TYPES[it.values.entityType];
-					return {
-						count: it.values.count,
-						color: it.values.color,
-						title: it.name,
-						icon: it.values.icon,
-						icon_back: it.values.icon,
-						contents: entityMeta.fnGetContents(it.values.entity),
-						tags: entityMeta.fnGetTags(it.values.entity),
-					};
-				});
+				const toDownload = this._list.items.map(it => this._getCardJson(it));
 				DataUtil.userDownload("rpg-cards", toDownload, {isSkipAdditionalMetadata: true});
 			});
 		ee`<div class="ve-w-100 ve-no-shrink ve-flex-v-center ve-mb-3">${iptSearch}${btnAdd}${btnReset}${btnExport}</div>`.appendTo(wrpContainer);
@@ -306,6 +318,7 @@ class MakeCards extends BaseComponent {
 		cardMeta.count = cardMeta.count || 1;
 
 		const loaded = await DataLoader.pCacheAndGet(cardMeta.page, cardMeta.source, cardMeta.hash);
+		const imageUrl = await MakeCards._pGetImageUrl(loaded);
 
 		const cbSel = ee`<input type="checkbox">`;
 
@@ -342,16 +355,7 @@ class MakeCards extends BaseComponent {
 
 		const btnCopy = ee`<button class="ve-btn ve-btn-default ve-btn-xs ve-mr-2" title="Copy JSON (SHIFT to view JSON)"><span class="glyphicon glyphicon-copy"></span></button>`
 			.onn("click", async evt => {
-				const entityMeta = MakeCards._AVAILABLE_TYPES[listItem.values.entityType];
-				const toCopy = {
-					count: listItem.values.count,
-					color: listItem.values.color,
-					title: listItem.name,
-					icon: listItem.values.icon,
-					icon_back: listItem.values.icon,
-					contents: entityMeta.fnGetContents(listItem.values.entity),
-					tags: entityMeta.fnGetTags(listItem.values.entity),
-				};
+				const toCopy = this._getCardJson(listItem);
 
 				if (evt.shiftKey) {
 					Renderer.hover.getShowWindow(
@@ -400,6 +404,7 @@ class MakeCards extends BaseComponent {
 				entityType: cardMeta.entityType,
 
 				entity: loaded,
+				imageUrl,
 			},
 			{
 				cbSel,
@@ -410,6 +415,69 @@ class MakeCards extends BaseComponent {
 		);
 		return listItem;
 	}
+
+	_getCardJson (listItem) {
+		const entityMeta = MakeCards._AVAILABLE_TYPES[listItem.values.entityType];
+
+		const contents = entityMeta.fnGetContents(listItem.values.entity);
+		if (this._state.isImageFront && listItem.values.imageUrl) {
+			const ixPicture = contents.length && contents[0].startsWith("subtitle |") ? 1 : 0;
+			contents.splice(ixPicture, 0, `picture | ${listItem.values.imageUrl} | ${this._state.imageFrontHeight || 100}`);
+		}
+
+		const out = {
+			count: listItem.values.count,
+			color: listItem.values.color,
+			title: listItem.name,
+			icon: listItem.values.icon,
+			icon_back: listItem.values.icon,
+			contents,
+			tags: entityMeta.fnGetTags(listItem.values.entity),
+		};
+		if (this._state.isImageBack && listItem.values.imageUrl) out.background_image = listItem.values.imageUrl;
+		return out;
+	}
+
+	// region images
+	static async _pGetImageUrl (entity) {
+		try {
+			return await this._pGetImageUrl_(entity);
+		} catch (e) {
+			// Images are non-critical; never let a failed lookup block card creation
+			setTimeout(() => { throw e; });
+			return null;
+		}
+	}
+
+	static async _pGetImageUrl_ (entity) {
+		let image = this._getFluffImage(await Renderer.utils.pGetProxyFluff({entity}));
+
+		// Fall back on the base item's art for e.g. specific magic variants ("+1 Battleaxe")
+		if (!image && entity._baseName) {
+			const baseSource = entity._baseSource || entity.source;
+			const hash = UrlUtil.URL_TO_HASH_BUILDER[UrlUtil.PG_ITEMS]({name: entity._baseName, source: baseSource});
+			const baseItem = await DataLoader.pCacheAndGet(UrlUtil.PG_ITEMS, baseSource, hash);
+			if (baseItem) image = this._getFluffImage(await Renderer.utils.pGetProxyFluff({entity: baseItem}));
+		}
+
+		if (image?.href?.type === "internal") return encodeURI(`${MakeCards._IMG_URL_BASE}${image.href.path}`);
+		if (image?.href?.type === "external") return image.href.url;
+
+		// Fall back on the token for creatures without fluff art
+		if (entity.__prop === "monster" && Renderer.monster.hasToken(entity)) {
+			const url = Renderer.monster.getTokenUrl(entity);
+			return /^https?:\/\//i.test(url) ? url : encodeURI(`${MakeCards._IMG_URL_BASE.replace(/img\/$/, "")}${url}`);
+		}
+
+		return null;
+	}
+
+	static _getFluffImage (fluff) {
+		if (!fluff?.images?.length) return null;
+		return fluff.images.find(img => img?.href && !["map", "mapPlayer"].includes(img.imageType))
+			|| fluff.images[0];
+	}
+	// endregion
 
 	// region contents
 	static _ct_subtitle (val) { return `subtitle | ${val}`; }
@@ -736,10 +804,13 @@ class MakeCards extends BaseComponent {
 	}
 }
 MakeCards._DEFAULT_STATE = {
-
+	isImageFront: true,
+	isImageBack: false,
+	imageFrontHeight: 100,
 };
 MakeCards._COLOR_DEFAULT = "#333333";
 MakeCards._ICON_DEFAULT = "perspective-dice-six-faces-random";
+MakeCards._IMG_URL_BASE = "https://5e.tools/img/";
 MakeCards._STORAGE_KEY = "cardState";
 MakeCards._AVAILABLE_TYPES = {
 	creature: {
